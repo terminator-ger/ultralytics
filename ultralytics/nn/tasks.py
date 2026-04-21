@@ -57,6 +57,7 @@ from ultralytics.nn.modules import (
     LRPCHead,
     Pose,
     Pose26,
+    Pose26Detect,
     RepC3,
     RepConv,
     RepNCSPELAN4,
@@ -338,7 +339,6 @@ class BaseModel(torch.nn.Module):
         """Initialize the loss criterion for the BaseModel."""
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
-
 class DetectionModel(BaseModel):
     """YOLO detection model.
 
@@ -617,6 +617,10 @@ class PoseModel(DetectionModel):
     def init_criterion(self):
         """Initialize the loss criterion for the PoseModel."""
         return E2ELoss(self, PoseLoss26) if getattr(self, "end2end", False) else v8PoseLoss(self)
+
+class PoseDetectModel(PoseModel):
+    def __init__(self, cfg="yolo26n-pose-detect.yaml", ch=3, nc=None, data_kpt_shape=(None, None), verbose=True):
+        super().__init__(cfg=cfg, ch=ch, nc=nc, data_kpt_shape=data_kpt_shape, verbose=verbose)
 
 
 class ClassificationModel(BaseModel):
@@ -1688,6 +1692,7 @@ def parse_model(d, ch, verbose=True):
                 YOLOESegment,
                 YOLOESegment26,
                 Pose,
+                Pose26Detect,
                 Pose26,
                 OBB,
                 OBB26,
@@ -1782,6 +1787,8 @@ def guess_model_task(model):
     def cfg2task(cfg):
         """Guess from YAML dictionary."""
         m = cfg["head"][-1][-2].lower()  # output module name
+        if "posedetect" in m:
+            return "posedetect"
         if m in {"classify", "classifier", "cls", "fc"}:
             return "classify"
         if "detect" in m:

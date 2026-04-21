@@ -4,6 +4,7 @@ from .tasks import (
     BaseModel,
     ClassificationModel,
     DetectionModel,
+    PoseDetectModel,
     SegmentationModel,
     guess_model_scale,
     guess_model_task,
@@ -16,6 +17,7 @@ from .tasks import (
 __all__ = (
     "BaseModel",
     "ClassificationModel",
+    "PoseDetectModel",
     "DetectionModel",
     "SegmentationModel",
     "guess_model_scale",

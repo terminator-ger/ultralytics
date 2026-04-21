@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from geomloss import SamplesLoss
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,7 +18,7 @@ from ultralytics.utils.torch_utils import autocast
 
 from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
-
+#from ultralytics.utils.callbacks.custom import EpochCallback
 
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
@@ -329,6 +331,45 @@ class KeypointLoss(nn.Module):
         e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
         return (kpt_loss_factor.view(-1, 1) * ((1 - torch.exp(-e)) * kpt_mask)).mean()
 
+class KeypointLossWithoutOrder(nn.Module):
+    def __init__(self, sigmas: torch.Tensor) -> None:
+        super().__init__()
+        self.sigmas = sigmas
+        #self.euclidean_distance_loss_with_assigment = SamplesLoss("sinkhorn", p=2, blur=0.9)
+        self.kp_loss = SamplesLoss("sinkhorn", 
+                                   p=2, 
+                                   blur=0.05, 
+                                   scaling=0.7, 
+                                   debias=True)
+    
+    def shoelace_area(self, x, y):
+        """
+        Calculates the area of a polygon using the shoelace formula.
+        Args:
+            x (Tensor): Tensor of x-coordinates (shape: [N,4])
+            y (Tensor): Tensor of y-coordinates (shape: [N,4])
+        Returns:
+            Tensor: Area of the polygon
+        """
+        # Shift indices for (x_{i+1} and y_{i+1})
+        # The last vertex wraps back to the first
+        x_next = torch.roll(x, -1)
+        y_next = torch.roll(y, -1)
+        
+        # Shoelace formula components: x_i * y_{i+1} - x_{i+1} * y_i
+        area = 0.5 * torch.abs(torch.sum(x * y_next - x_next * y))
+        
+        return area
+
+    def forward(self, pred_kpts: torch.Tensor, gt_kpts: torch.Tensor, kpt_mask: torch.Tensor, area: torch.Tensor)->torch.Tensor:
+        #update blur with epoch
+        #d = self.kp_loss(pred_kpts.to(gt_kpts.dtype), gt_kpts[...,:2])
+        d = self.kp_loss(pred_kpts[kpt_mask,:2].to(gt_kpts.dtype), gt_kpts[kpt_mask,:2])
+        #area = self.shoelace_area(pred_kpts[...,0], pred_kpts[...,1])
+        ##kpt_loss_factor = kpt_mask.shape[1] / (torch.sum(kpt_mask != 0, dim=1) + 1e-9)
+        ##e = d / ((2 * self.sigmas).pow(2) * (area + 1e-9) * 2)  # from cocoeval
+        #return (1 - torch.exp(-d))# - torch.exp(-area))
+        return d.mean()
 
 class v8DetectionLoss:
     """Criterion class for computing training losses for YOLOv8 object detection."""
@@ -645,6 +686,7 @@ class v8PoseLoss(v8DetectionLoss):
         is_pose = self.kpt_shape == [17, 3]
         nkpt = self.kpt_shape[0]  # number of keypoints
         sigmas = torch.from_numpy(OKS_SIGMA).to(self.device) if is_pose else torch.ones(nkpt, device=self.device) / nkpt
+        #self.keypoint_loss = KeypointLossWithoutOrder(sigmas=sigmas)
         self.keypoint_loss = KeypointLoss(sigmas=sigmas)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -802,6 +844,8 @@ class PoseLoss26(v8PoseLoss):
         nkpt = self.kpt_shape[0]  # number of keypoints
         self.rle_loss = None
         self.flow_model = model.model[-1].flow_model if hasattr(model.model[-1], "flow_model") else None
+        self.keypoints_are_normalized = False
+
         if self.flow_model is not None:
             self.rle_loss = RLELoss(use_target_weight=True).to(self.device)
             self.target_weights = (
@@ -835,8 +879,12 @@ class PoseLoss26(v8PoseLoss):
         # Keypoint loss
         if fg_mask.sum():
             keypoints = batch["keypoints"].to(self.device).float().clone()
-            keypoints[..., 0] *= imgsz[1]
-            keypoints[..., 1] *= imgsz[0]
+            if self.keypoints_are_normalized:
+                pred_kpts[...,0] /= imgsz[1]
+                pred_kpts[...,1] /= imgsz[0]
+            else:
+                keypoints[..., 0] *= imgsz[1]
+                keypoints[..., 1] *= imgsz[0]
 
             keypoints_loss = self.calculate_keypoints_loss(
                 fg_mask,

@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "Pose26Detect"
 
 
 class Detect(nn.Module):
@@ -768,6 +768,101 @@ class Pose26(Pose):
             y[:, 1::ndim] = (y[:, 1::ndim] + self.anchors[1]) * self.strides
             return y
 
+class Pose26Detect(nn.Module):
+    """YOLO26 Pose head for keypoints models with detection capabilities.
+
+    This class extends the Pose26 head to include both keypoint prediction and object detection capabilities.
+
+    Attributes:
+        Inherits all attributes from Pose26 and Detect classes.
+
+    Methods:
+        forward: Perform forward pass through YOLO model and return predictions.
+        kpts_decode: Decode keypoints from predictions.
+
+    Examples:
+        Create a pose detection head
+        >>> pose_detect = Pose26Detect(nc=80, kpt_shape=(17, 3), ch=(256, 512, 1024))
+        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+        >>> outputs = pose_detect(x)
+    """
+    def __init__(self, nc: int = 80, kpt_shape: tuple = (17, 3), reg_max=16, end2end=False, ch: tuple = ()):
+        """Initialize YOLO network with default parameters and Convolutional Layers.
+
+        Args:
+            nc (int): Number of classes.
+            kpt_shape (tuple): Number of keypoints, number of dims (2 for x,y or 3 for x,y,visible).
+            reg_max (int): Maximum number of DFL channels.
+            end2end (bool): Whether to use end-to-end NMS-free detection.
+            ch (tuple): Tuple of channel sizes from backbone feature maps.
+        """
+        super().__init__()#nc, kpt_shape, reg_max, end2end, ch)
+        self.pose_head = Pose26(nc, kpt_shape, reg_max, end2end, ch)
+        self.det_head = Detect(nc, reg_max, end2end, ch)
+    
+    def forward(self, x: list[torch.Tensor]) -> tuple | list[torch.Tensor] | dict[str, torch.Tensor]:
+        """Perform forward pass through YOLO model and return predictions."""
+        pose_preds = self.pose_head.forward(x)
+        det_preds = self.det_head.forward(x)
+        if self.training:
+            if isinstance(pose_preds, tuple):
+                return {"pose": pose_preds[1], "det": det_preds[1]}  # for loss calculation, use the second element which is the raw output before post-processing
+            else:
+                return dict(pose=pose_preds, det=det_preds)
+        if self.export:
+            return {"pose": pose_preds[0], "det": det_preds[0]}  # for export, return a single dict with raw outputs
+        return ({"pose": pose_preds[0], "det": det_preds[0]}, {"pose": pose_preds[1], "det": det_preds[1]})  # for export, use the first element which is the post-processed output
+
+    @property
+    def one2many(self):
+        """Returns the one-to-many head components, here for backward compatibility."""
+        o2m = {}
+        o2m.update({f"pose_{k}": v for k, v in self.pose_head.one2many.items()})
+        o2m.update({f"det_{k}": v for k, v in self.det_head.one2many.items()})
+        return o2m
+
+    @property
+    def one2one(self):
+        """Returns the one-to-one head components."""
+        o2o = {}
+        o2o.update({f"pose_{k}": v for k, v in self.pose_head.one2one.items()})
+        o2o.update({f"det_{k}": v for k, v in self.det_head.one2one.items()})
+        return o2o
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        det_box_head: torch.nn.Module,
+        det_cls_head: torch.nn.Module,
+        pose_box_head: torch.nn.Module,
+        pose_cls_head: torch.nn.Module,
+        pose_pose_head: torch.nn.Module,
+        pose_kpts_head: torch.nn.Module,
+        pose_kpts_sigma_head: torch.nn.Module,
+    ) -> dict[str, torch.Tensor]:
+        """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
+        pose_preds = self.pose_head.forward_head(x, pose_box_head, pose_cls_head, pose_pose_head, pose_kpts_head, pose_kpts_sigma_head)
+        det_preds = self.det_head.forward_head(x, det_box_head, det_cls_head)
+        fh = {}
+        fh.update({f"pose_{k}": v for k, v in pose_preds.items()})
+        fh.update({f"det_{k}": v for k, v in det_preds.items()})
+        return fh
+    
+    def fuse(self) -> None:
+        """Remove the one2many head for inference optimization."""
+        self.pose_head.fuse()
+        self.det_head.fuse()
+
+    def postprocess(self, preds):
+        det = self.det_head.postprocess(preds["det"])
+        kp = self.pose_head.postprocess(preds["pose"])
+        return dict(det=det, pose=kp)
+
+    
+    def _inference(self, x):
+        pose_preds = self.pose_head._inference(x)
+        det_preds = self.det_head._inference(x)
+        return dict(det=det_preds, pose=pose_preds)
 
 class Classify(nn.Module):
     """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2).
